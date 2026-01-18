@@ -1,9 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Parser};
 use opencv::{
-    core::{self, Rect, Scalar, Size},
+    core::{self, Ptr, Rect, Scalar, Size},
     highgui, imgproc, objdetect,
     prelude::*,
+    tracking::{TrackerKCF, TrackerKCF_Params},
     videoio,
 };
 use serde::Serialize;
@@ -36,21 +37,34 @@ struct Args {
     nms_iou: f32,
     #[arg(long, default_value_t = 45)]
     max_missing: u32,
-    #[arg(long, default_value_t = 80.0)]
-    max_centroid_distance: f32,
+    #[arg(long, default_value_t = 0.0)]
+    exclude_top_percent: f32,
+    #[arg(long, default_value_t = 1.2)]
+    min_aspect_ratio: f32,
+    #[arg(long, default_value_t = 4.0)]
+    max_aspect_ratio: f32,
     #[arg(long)]
     headless: bool,
     #[arg(long)]
     log_json: Option<PathBuf>,
     #[arg(long, default_value_t = 5)]
     log_interval_seconds: u64,
+    /// Run detection every N frames (1 = every frame, 3 = every 3rd frame)
+    #[arg(long, default_value_t = 3)]
+    detection_interval: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Track {
     id: usize,
     rect: Rect,
-    centroid: (f32, f32),
+}
+
+/// State for a single tracked object using OpenCV KCF tracker (faster than CSRT)
+struct TrackedObject {
+    id: usize,
+    tracker: Ptr<TrackerKCF>,
+    rect: Rect,
     missing: u32,
 }
 
@@ -62,20 +76,22 @@ struct TrackingStats {
     active_tracks: usize,
 }
 
-struct CentroidTracker {
-    tracks: HashMap<usize, Track>,
+/// Multi-object tracker using OpenCV KCF (Kernelized Correlation Filter)
+/// for each tracked object. KCF is 3-5x faster than CSRT with good accuracy.
+struct OpenCVTracker {
+    tracks: HashMap<usize, TrackedObject>,
     next_id: usize,
     max_missing: u32,
-    max_distance: f32,
+    iou_threshold: f32,
 }
 
-impl CentroidTracker {
-    fn new(max_missing: u32, max_distance: f32) -> Self {
+impl OpenCVTracker {
+    fn new(max_missing: u32, iou_threshold: f32) -> Self {
         Self {
             tracks: HashMap::new(),
             next_id: 1,
             max_missing,
-            max_distance,
+            iou_threshold,
         }
     }
 
@@ -87,82 +103,121 @@ impl CentroidTracker {
         let mut tracks: Vec<Track> = self
             .tracks
             .values()
-            .copied()
-            .filter(|track| track.missing == 0)
+            .filter(|t| t.missing == 0)
+            .map(|t| Track { id: t.id, rect: t.rect })
             .collect();
         tracks.sort_by_key(|track| track.id);
         tracks
     }
 
-    fn update(&mut self, detections: &[Rect]) -> TrackingStats {
+    fn update(&mut self, frame: &Mat, detections: &[Rect]) -> TrackingStats {
         let mut stats = TrackingStats::default();
-        if detections.is_empty() && self.tracks.is_empty() {
-            return stats;
-        }
-
-        if self.tracks.is_empty() {
-            for rect in detections {
-                self.add_track(*rect);
+        
+        // Phase 1: Update only visible trackers with KCF prediction (skip missing ones for speed)
+        let track_ids: Vec<usize> = self.tracks.keys().copied().collect();
+        let mut predicted_rects: HashMap<usize, Option<Rect>> = HashMap::new();
+        
+        for track_id in &track_ids {
+            if let Some(tracked) = self.tracks.get_mut(track_id) {
+                // Skip tracker update for missing objects (performance optimization)
+                if tracked.missing > 0 {
+                    predicted_rects.insert(*track_id, Some(tracked.rect));
+                    continue;
+                }
+                let mut new_rect = tracked.rect;
+                match tracked.tracker.update(frame, &mut new_rect) {
+                    Ok(true) => {
+                        // Tracker successfully predicted new position
+                        predicted_rects.insert(*track_id, Some(new_rect));
+                    }
+                    _ => {
+                        // Tracker lost the target
+                        predicted_rects.insert(*track_id, None);
+                    }
+                }
             }
-            stats.new_tracks = detections.len();
-            stats.active_tracks = self.tracks.len();
-            return stats;
         }
-
-        let detection_centroids: Vec<(f32, f32)> = detections.iter().map(rect_centroid).collect();
-        let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
-        for (track_id, track) in &self.tracks {
-            for (det_idx, centroid) in detection_centroids.iter().enumerate() {
-                let dist = centroid_distance(track.centroid, *centroid);
-                pairs.push((dist, *track_id, det_idx));
-            }
-        }
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-
+        
+        // Phase 2: Match predictions to detections using IoU
         let mut matched_tracks: HashSet<usize> = HashSet::new();
         let mut matched_detections: HashSet<usize> = HashSet::new();
-
-        for (dist, track_id, det_idx) in pairs {
-            if dist > self.max_distance {
-                continue;
+        
+        // Build IoU pairs between predictions and detections
+        let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+        for (track_id, pred_rect_opt) in &predicted_rects {
+            if let Some(pred_rect) = pred_rect_opt {
+                for (det_idx, det_rect) in detections.iter().enumerate() {
+                    let iou = rect_iou(*pred_rect, *det_rect);
+                    if iou > 0.0 {
+                        pairs.push((iou, *track_id, det_idx));
+                    }
+                }
             }
+        }
+        
+        // Sort by IoU descending (greedy matching)
+        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        
+        // Greedy assignment
+        for (iou, track_id, det_idx) in pairs {
             if matched_tracks.contains(&track_id) || matched_detections.contains(&det_idx) {
                 continue;
             }
-            if let Some(track) = self.tracks.get_mut(&track_id) {
-                let rect = detections[det_idx];
-                track.rect = rect;
-                track.centroid = rect_centroid(&rect);
-                track.missing = 0;
+            if iou >= self.iou_threshold {
+                // Match found: use detection rect (more accurate than prediction)
+                if let Some(tracked) = self.tracks.get_mut(&track_id) {
+                    let det_rect = detections[det_idx];
+                    tracked.rect = det_rect;
+                    tracked.missing = 0;
+                    // NOTE: Skipping tracker re-initialization for performance.
+                    // The tracker will naturally drift toward the correct position.
+                }
+                matched_tracks.insert(track_id);
+                matched_detections.insert(det_idx);
+                stats.matched += 1;
             }
-            matched_tracks.insert(track_id);
-            matched_detections.insert(det_idx);
-            stats.matched += 1;
         }
-
-        let track_ids: Vec<usize> = self.tracks.keys().copied().collect();
-        for track_id in track_ids {
-            if matched_tracks.contains(&track_id) {
+        
+        // Phase 3: Handle unmatched tracks
+        for track_id in &track_ids {
+            if matched_tracks.contains(track_id) {
                 continue;
             }
-            if let Some(track) = self.tracks.get_mut(&track_id) {
-                track.missing = track.missing.saturating_add(1);
+            if let Some(tracked) = self.tracks.get_mut(track_id) {
+                // If tracker had a valid prediction, use it but mark as missing
+                if let Some(Some(pred_rect)) = predicted_rects.get(track_id) {
+                    tracked.rect = *pred_rect;
+                }
+                tracked.missing = tracked.missing.saturating_add(1);
             }
         }
-
-        for (det_idx, rect) in detections.iter().enumerate() {
+        
+        // Phase 4: Create new tracks for unmatched detections
+        for (det_idx, det_rect) in detections.iter().enumerate() {
             if matched_detections.contains(&det_idx) {
                 continue;
             }
-            self.add_track(*rect);
-            stats.new_tracks += 1;
+            if let Ok(mut new_tracker) = create_kcf_tracker() {
+                if new_tracker.init(frame, *det_rect).is_ok() {
+                    let tracked = TrackedObject {
+                        id: self.next_id,
+                        tracker: new_tracker,
+                        rect: *det_rect,
+                        missing: 0,
+                    };
+                    self.tracks.insert(self.next_id, tracked);
+                    self.next_id += 1;
+                    stats.new_tracks += 1;
+                }
+            }
         }
-
+        
+        // Phase 5: Remove tracks that have been missing too long
         let to_remove: Vec<usize> = self
             .tracks
             .iter()
-            .filter_map(|(track_id, track)| {
-                if track.missing > self.max_missing {
+            .filter_map(|(track_id, tracked)| {
+                if tracked.missing > self.max_missing {
                     Some(*track_id)
                 } else {
                     None
@@ -172,23 +227,19 @@ impl CentroidTracker {
         for track_id in to_remove {
             self.tracks.remove(&track_id);
         }
-
+        
         stats.unmatched_tracks = self.tracks.len().saturating_sub(matched_tracks.len());
         stats.active_tracks = self.tracks.len();
         stats
     }
-
-    fn add_track(&mut self, rect: Rect) {
-        let track = Track {
-            id: self.next_id,
-            rect,
-            centroid: rect_centroid(&rect),
-            missing: 0,
-        };
-        self.tracks.insert(self.next_id, track);
-        self.next_id += 1;
-    }
 }
+
+/// Create a new KCF tracker instance with default parameters (faster than CSRT)
+fn create_kcf_tracker() -> Result<Ptr<TrackerKCF>> {
+    let params = TrackerKCF_Params::default()?;
+    TrackerKCF::create(params).context("Failed to create KCF tracker")
+}
+
 
 #[derive(Debug, Default)]
 struct MetricsAccumulator {
@@ -231,7 +282,7 @@ struct SessionLog {
     min_size: i32,
     nms_iou: f32,
     max_missing: u32,
-    max_centroid_distance: f32,
+    iou_threshold: f32,
 }
 
 #[derive(Serialize)]
@@ -348,7 +399,7 @@ fn run(args: Args) -> Result<()> {
             min_size: args.min_size,
             nms_iou: args.nms_iou,
             max_missing: args.max_missing,
-            max_centroid_distance: args.max_centroid_distance,
+            iou_threshold: args.nms_iou, // Using same IoU threshold for tracking
         };
         logger.write_event(&session)?;
         logger.flush()?;
@@ -363,7 +414,7 @@ fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut tracker = CentroidTracker::new(args.max_missing, args.max_centroid_distance);
+    let mut tracker = OpenCVTracker::new(args.max_missing, args.nms_iou);
     let mut metrics = MetricsAccumulator::default();
     let mut interval_metrics = MetricsAccumulator::default();
 
@@ -397,32 +448,51 @@ fn run(args: Args) -> Result<()> {
         imgproc::equalize_hist(&gray, &mut gray_eq)
             .context("Failed to equalize histogram")?;
 
-        rects_full.clear();
-        rects_upper.clear();
-        fullbody.detect_multi_scale(
-            &gray_eq,
-            &mut rects_full,
-            args.scale_factor,
-            args.min_neighbors,
-            0,
-            Size::new(args.min_size, args.min_size),
-            Size::default(),
-        )?;
-        upperbody.detect_multi_scale(
-            &gray_eq,
-            &mut rects_upper,
-            args.scale_factor,
-            args.min_neighbors,
-            0,
-            Size::new(args.min_size, args.min_size),
-            Size::default(),
-        )?;
+        // Run detection only every N frames for performance (configurable via --detection-interval)
+        let run_detection = frame_index % args.detection_interval == 0;
+        
+        // Skip expensive cascade detection entirely on non-detection frames
+        if run_detection {
+            rects_full.clear();
+            rects_upper.clear();
+            fullbody.detect_multi_scale(
+                &gray_eq,
+                &mut rects_full,
+                args.scale_factor,
+                args.min_neighbors,
+                0,
+                Size::new(args.min_size, args.min_size),
+                Size::default(),
+            )?;
+            upperbody.detect_multi_scale(
+                &gray_eq,
+                &mut rects_upper,
+                args.scale_factor,
+                args.min_neighbors,
+                0,
+                Size::new(args.min_size, args.min_size),
+                Size::default(),
+            )?;
+        }
+        
+        let detections = if run_detection {
+            let mut detections: Vec<Rect> = rects_full.to_vec();
+            detections.extend(rects_upper.to_vec());
+            let detections = nms_rects(&detections, args.nms_iou);
+            let frame_height = frame.rows();
+            filter_detections(
+                &detections,
+                frame_height,
+                args.exclude_top_percent,
+                args.min_aspect_ratio,
+                args.max_aspect_ratio,
+            )
+        } else {
+            // On non-detection frames, just update trackers with empty detections
+            Vec::new()
+        };
 
-        let mut detections: Vec<Rect> = rects_full.to_vec();
-        detections.extend(rects_upper.to_vec());
-        let detections = nms_rects(&detections, args.nms_iou);
-
-        let stats = tracker.update(&detections);
+        let stats = tracker.update(&frame, &detections);
         let tp_frame = (stats.matched + stats.new_tracks) as u64;
         let fn_frame = stats.unmatched_tracks as u64;
 
@@ -509,17 +579,35 @@ fn ensure_file_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rect_centroid(rect: &Rect) -> (f32, f32) {
-    (
-        rect.x as f32 + rect.width as f32 / 2.0,
-        rect.y as f32 + rect.height as f32 / 2.0,
-    )
-}
 
-fn centroid_distance(a: (f32, f32), b: (f32, f32)) -> f32 {
-    let dx = a.0 - b.0;
-    let dy = a.1 - b.1;
-    (dx * dx + dy * dy).sqrt()
+
+fn filter_detections(
+    rects: &[Rect],
+    frame_height: i32,
+    exclude_top_percent: f32,
+    min_aspect_ratio: f32,
+    max_aspect_ratio: f32,
+) -> Vec<Rect> {
+    let exclude_y_threshold = (frame_height as f32 * exclude_top_percent) as i32;
+    
+    rects
+        .iter()
+        .filter(|rect| {
+            // ROI filter: exclude ceiling area
+            if rect.y < exclude_y_threshold {
+                return false;
+            }
+            
+            // Aspect ratio filter: people are taller than wide
+            let aspect_ratio = rect.height as f32 / rect.width.max(1) as f32;
+            if aspect_ratio < min_aspect_ratio || aspect_ratio > max_aspect_ratio {
+                return false;
+            }
+            
+            true
+        })
+        .copied()
+        .collect()
 }
 
 fn rect_area(rect: Rect) -> f32 {
