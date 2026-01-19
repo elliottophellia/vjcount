@@ -52,6 +52,12 @@ struct Args {
     /// Run detection every N frames (1 = every frame, 3 = every 3rd frame)
     #[arg(long, default_value_t = 3)]
     detection_interval: u64,
+    /// Frames a track must persist to be "confirmed" as a true positive
+    #[arg(long, default_value_t = 3)]
+    confirmation_frames: u32,
+    /// Tracks disappearing within this many frames are marked as heuristic false positives
+    #[arg(long, default_value_t = 2)]
+    rejection_frames: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +72,8 @@ struct TrackedObject {
     tracker: Ptr<TrackerKCF>,
     rect: Rect,
     missing: u32,
+    lifetime: u32,   // Total frames this track has existed
+    confirmed: bool, // Has reached confirmation threshold (considered real detection)
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +82,13 @@ struct TrackingStats {
     new_tracks: usize,
     unmatched_tracks: usize,
     active_tracks: usize,
+    confirmed_tracks: usize,
+    // Confusion matrix for this frame
+    tp: u64,  // True Positive: confirmed tracks currently visible
+    fp: u64,  // False Positive: unmatched detections + rejected tracks
+    fn_: u64, // False Negative: confirmed tracks currently missing
+    // Heuristic FP: tracks rejected this frame (disappeared before confirmation)
+    rejected_tracks: usize,
 }
 
 /// Multi-object tracker using OpenCV KCF (Kernelized Correlation Filter)
@@ -83,15 +98,22 @@ struct OpenCVTracker {
     next_id: usize,
     max_missing: u32,
     iou_threshold: f32,
+    confirmation_frames: u32,
+    rejection_frames: u32,
+    // Track rejected (heuristic FP) count for lifetime stats
+    total_rejected: usize,
 }
 
 impl OpenCVTracker {
-    fn new(max_missing: u32, iou_threshold: f32) -> Self {
+    fn new(max_missing: u32, iou_threshold: f32, confirmation_frames: u32, rejection_frames: u32) -> Self {
         Self {
             tracks: HashMap::new(),
             next_id: 1,
             max_missing,
             iou_threshold,
+            confirmation_frames,
+            rejection_frames,
+            total_rejected: 0,
         }
     }
 
@@ -113,7 +135,15 @@ impl OpenCVTracker {
     fn update(&mut self, frame: &Mat, detections: &[Rect]) -> TrackingStats {
         let mut stats = TrackingStats::default();
         
-        // Phase 1: Update only visible trackers with KCF prediction (skip missing ones for speed)
+        // Phase 1: Increment lifetime for all tracks and update confirmation status
+        for tracked in self.tracks.values_mut() {
+            tracked.lifetime = tracked.lifetime.saturating_add(1);
+            if tracked.lifetime >= self.confirmation_frames {
+                tracked.confirmed = true;
+            }
+        }
+        
+        // Phase 2: Update only visible trackers with KCF prediction (skip missing ones for speed)
         let track_ids: Vec<usize> = self.tracks.keys().copied().collect();
         let mut predicted_rects: HashMap<usize, Option<Rect>> = HashMap::new();
         
@@ -138,7 +168,7 @@ impl OpenCVTracker {
             }
         }
         
-        // Phase 2: Match predictions to detections using IoU
+        // Phase 3: Match predictions to detections using IoU
         let mut matched_tracks: HashSet<usize> = HashSet::new();
         let mut matched_detections: HashSet<usize> = HashSet::new();
         
@@ -178,7 +208,7 @@ impl OpenCVTracker {
             }
         }
         
-        // Phase 3: Handle unmatched tracks
+        // Phase 4: Handle unmatched tracks (increment missing counter)
         for track_id in &track_ids {
             if matched_tracks.contains(track_id) {
                 continue;
@@ -192,7 +222,7 @@ impl OpenCVTracker {
             }
         }
         
-        // Phase 4: Create new tracks for unmatched detections
+        // Phase 5: Create new tracks for unmatched detections
         for (det_idx, det_rect) in detections.iter().enumerate() {
             if matched_detections.contains(&det_idx) {
                 continue;
@@ -204,6 +234,8 @@ impl OpenCVTracker {
                         tracker: new_tracker,
                         rect: *det_rect,
                         missing: 0,
+                        lifetime: 1,
+                        confirmed: 1 >= self.confirmation_frames, // Check if immediately confirmed
                     };
                     self.tracks.insert(self.next_id, tracked);
                     self.next_id += 1;
@@ -212,24 +244,60 @@ impl OpenCVTracker {
             }
         }
         
-        // Phase 5: Remove tracks that have been missing too long
-        let to_remove: Vec<usize> = self
+        // Phase 6: Remove tracks that have been missing too long, detect rejected tracks
+        let to_remove: Vec<(usize, bool, bool)> = self
             .tracks
             .iter()
             .filter_map(|(track_id, tracked)| {
                 if tracked.missing > self.max_missing {
-                    Some(*track_id)
+                    // Track is being removed - check if it was rejected (heuristic FP)
+                    let was_confirmed = tracked.confirmed;
+                    let was_rejected = !was_confirmed && tracked.lifetime <= self.rejection_frames;
+                    Some((*track_id, was_confirmed, was_rejected))
                 } else {
                     None
                 }
             })
             .collect();
-        for track_id in to_remove {
-            self.tracks.remove(&track_id);
+        
+        for (track_id, _was_confirmed, was_rejected) in &to_remove {
+            self.tracks.remove(track_id);
+            if *was_rejected {
+                stats.rejected_tracks += 1;
+                self.total_rejected += 1;
+            }
         }
         
-        stats.unmatched_tracks = self.tracks.len().saturating_sub(matched_tracks.len());
+        // Phase 7: Compute confusion matrix metrics for this frame
+        // TP: Confirmed tracks that are currently visible (matched this frame)
+        // FP: Unmatched detections (new tracks that haven't been confirmed yet) + rejected tracks
+        // FN: Confirmed tracks that are currently missing
+        
+        let confirmed_visible: usize = self
+            .tracks
+            .values()
+            .filter(|t| t.confirmed && t.missing == 0)
+            .count();
+        
+        let confirmed_missing: usize = self
+            .tracks
+            .values()
+            .filter(|t| t.confirmed && t.missing > 0)
+            .count();
+        
+        let unconfirmed_visible: usize = self
+            .tracks
+            .values()
+            .filter(|t| !t.confirmed && t.missing == 0)
+            .count();
+        
+        stats.tp = confirmed_visible as u64;
+        stats.fp = unconfirmed_visible as u64 + stats.rejected_tracks as u64;
+        stats.fn_ = confirmed_missing as u64;
+        
+        stats.unmatched_tracks = self.tracks.iter().filter(|(_, t)| t.missing > 0).count();
         stats.active_tracks = self.tracks.len();
+        stats.confirmed_tracks = self.tracks.values().filter(|t| t.confirmed).count();
         stats
     }
 }
@@ -241,32 +309,69 @@ fn create_kcf_tracker() -> Result<Ptr<TrackerKCF>> {
 }
 
 
-#[derive(Debug, Default)]
-struct MetricsAccumulator {
-    tp: u64,
-    fn_count: u64,
+#[derive(Debug, Default, Clone)]
+struct ConfusionMatrix {
+    tp: u64,  // True Positive
+    tn: u64,  // True Negative
+    fp: u64,  // False Positive
+    fn_: u64, // False Negative (fn is reserved keyword)
     frames: u64,
     detections: u64,
 }
 
-impl MetricsAccumulator {
-    fn update(&mut self, detections: usize, tp: u64, fn_count: u64) {
+impl ConfusionMatrix {
+    fn update(&mut self, detections: usize, tp: u64, tn: u64, fp: u64, fn_: u64) {
         self.tp += tp;
-        self.fn_count += fn_count;
+        self.tn += tn;
+        self.fp += fp;
+        self.fn_ += fn_;
         self.frames += 1;
         self.detections += detections as u64;
     }
 
     fn reset(&mut self) {
-        *self = MetricsAccumulator::default();
+        *self = ConfusionMatrix::default();
     }
 
-    fn detection_rate(&self) -> f64 {
-        let denom = self.tp + self.fn_count;
+    /// Precision = TP / (TP + FP)
+    fn precision(&self) -> f64 {
+        let denom = self.tp + self.fp;
         if denom == 0 {
             0.0
         } else {
             self.tp as f64 / denom as f64
+        }
+    }
+
+    /// Recall = TP / (TP + FN)
+    fn recall(&self) -> f64 {
+        let denom = self.tp + self.fn_;
+        if denom == 0 {
+            0.0
+        } else {
+            self.tp as f64 / denom as f64
+        }
+    }
+
+    /// F1 Score = 2 * (Precision * Recall) / (Precision + Recall)
+    fn f1_score(&self) -> f64 {
+        let p = self.precision();
+        let r = self.recall();
+        let denom = p + r;
+        if denom == 0.0 {
+            0.0
+        } else {
+            2.0 * p * r / denom
+        }
+    }
+
+    /// Accuracy = (TP + TN) / (TP + TN + FP + FN)
+    fn accuracy(&self) -> f64 {
+        let total = self.tp + self.tn + self.fp + self.fn_;
+        if total == 0 {
+            0.0
+        } else {
+            (self.tp + self.tn) as f64 / total as f64
         }
     }
 }
@@ -283,6 +388,8 @@ struct SessionLog {
     nms_iou: f32,
     max_missing: u32,
     iou_threshold: f32,
+    confirmation_frames: u32,
+    rejection_frames: u32,
 }
 
 #[derive(Serialize)]
@@ -291,15 +398,24 @@ struct FrameLog {
     timestamp: String,
     frame_index: u64,
     detections: usize,
-    matched_tracks: usize,
-    new_tracks: usize,
-    unmatched_tracks: usize,
     active_tracks: usize,
-    total_unique: usize,
-    tp_total: u64,
-    fn_total: u64,
-    detection_rate: f64,
-    detection_rate_percent: f64,
+    confirmed_tracks: usize,
+    // Frame-level confusion matrix
+    tp: u64,
+    tn: u64,
+    fp: u64,
+    #[serde(rename = "fn")]
+    fn_: u64,
+    // Cumulative totals
+    total_tp: u64,
+    total_tn: u64,
+    total_fp: u64,
+    #[serde(rename = "total_fn")]
+    total_fn_: u64,
+    // Derived metrics
+    precision: f64,
+    recall: f64,
+    f1_score: f64,
 }
 
 #[derive(Serialize)]
@@ -311,10 +427,18 @@ struct SummaryLog {
     interval_frames: u64,
     interval_detections: u64,
     total_unique: usize,
-    tp_total: u64,
-    fn_total: u64,
-    detection_rate: f64,
-    detection_rate_percent: f64,
+    total_rejected: usize,
+    // Cumulative confusion matrix
+    total_tp: u64,
+    total_tn: u64,
+    total_fp: u64,
+    #[serde(rename = "total_fn")]
+    total_fn_: u64,
+    // Derived metrics
+    precision: f64,
+    recall: f64,
+    f1_score: f64,
+    accuracy: f64,
 }
 
 struct JsonLogger {
@@ -400,6 +524,8 @@ fn run(args: Args) -> Result<()> {
             nms_iou: args.nms_iou,
             max_missing: args.max_missing,
             iou_threshold: args.nms_iou, // Using same IoU threshold for tracking
+            confirmation_frames: args.confirmation_frames,
+            rejection_frames: args.rejection_frames,
         };
         logger.write_event(&session)?;
         logger.flush()?;
@@ -414,9 +540,14 @@ fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut tracker = OpenCVTracker::new(args.max_missing, args.nms_iou);
-    let mut metrics = MetricsAccumulator::default();
-    let mut interval_metrics = MetricsAccumulator::default();
+    let mut tracker = OpenCVTracker::new(
+        args.max_missing,
+        args.nms_iou,
+        args.confirmation_frames,
+        args.rejection_frames,
+    );
+    let mut metrics = ConfusionMatrix::default();
+    let mut interval_metrics = ConfusionMatrix::default();
 
     let start_time = Instant::now();
     let mut last_summary = Instant::now();
@@ -493,27 +624,39 @@ fn run(args: Args) -> Result<()> {
         };
 
         let stats = tracker.update(&frame, &detections);
-        let tp_frame = (stats.matched + stats.new_tracks) as u64;
-        let fn_frame = stats.unmatched_tracks as u64;
+        
+        // Compute TN: only at frame level when 0 confirmed tracks AND 0 detections
+        // This means the frame has no expected people and correctly detected none
+        let tn_frame: u64 = if stats.confirmed_tracks == 0 && detections.is_empty() {
+            1
+        } else {
+            0
+        };
 
-        metrics.update(detections.len(), tp_frame, fn_frame);
-        interval_metrics.update(detections.len(), tp_frame, fn_frame);
+        metrics.update(detections.len(), stats.tp, tn_frame, stats.fp, stats.fn_);
+        interval_metrics.update(detections.len(), stats.tp, tn_frame, stats.fp, stats.fn_);
 
-        let detection_rate = metrics.detection_rate();
         let frame_log = FrameLog {
             event: "frame",
             timestamp: timestamp_now(),
             frame_index,
             detections: detections.len(),
-            matched_tracks: stats.matched,
-            new_tracks: stats.new_tracks,
-            unmatched_tracks: stats.unmatched_tracks,
             active_tracks: stats.active_tracks,
-            total_unique: tracker.total_unique(),
-            tp_total: metrics.tp,
-            fn_total: metrics.fn_count,
-            detection_rate,
-            detection_rate_percent: detection_rate * 100.0,
+            confirmed_tracks: stats.confirmed_tracks,
+            // Frame-level confusion matrix
+            tp: stats.tp,
+            tn: tn_frame,
+            fp: stats.fp,
+            fn_: stats.fn_,
+            // Cumulative totals
+            total_tp: metrics.tp,
+            total_tn: metrics.tn,
+            total_fp: metrics.fp,
+            total_fn_: metrics.fn_,
+            // Derived metrics
+            precision: metrics.precision(),
+            recall: metrics.recall(),
+            f1_score: metrics.f1_score(),
         };
         if let Some(logger) = json_logger.as_mut() {
             logger.write_event(&frame_log)?;
@@ -536,7 +679,6 @@ fn run(args: Args) -> Result<()> {
         }
 
         if last_summary.elapsed().as_secs() >= args.log_interval_seconds {
-            let detection_rate = metrics.detection_rate();
             let summary = SummaryLog {
                 event: "summary",
                 timestamp: timestamp_now(),
@@ -545,17 +687,28 @@ fn run(args: Args) -> Result<()> {
                 interval_frames: interval_metrics.frames,
                 interval_detections: interval_metrics.detections,
                 total_unique: tracker.total_unique(),
-                tp_total: metrics.tp,
-                fn_total: metrics.fn_count,
-                detection_rate,
-                detection_rate_percent: detection_rate * 100.0,
+                total_rejected: tracker.total_rejected,
+                // Cumulative confusion matrix
+                total_tp: metrics.tp,
+                total_tn: metrics.tn,
+                total_fp: metrics.fp,
+                total_fn_: metrics.fn_,
+                // Derived metrics
+                precision: metrics.precision(),
+                recall: metrics.recall(),
+                f1_score: metrics.f1_score(),
+                accuracy: metrics.accuracy(),
             };
             tracing::info!(
-                "frames={}, unique={}, detections={}, detection_rate={:.2}%",
+                "frames={} TP={} TN={} FP={} FN={} P={:.2}% R={:.2}% F1={:.2}%",
                 frame_index,
-                tracker.total_unique(),
-                interval_metrics.detections,
-                detection_rate * 100.0
+                metrics.tp,
+                metrics.tn,
+                metrics.fp,
+                metrics.fn_,
+                metrics.precision() * 100.0,
+                metrics.recall() * 100.0,
+                metrics.f1_score() * 100.0
             );
             if let Some(logger) = json_logger.as_mut() {
                 logger.write_event(&summary)?;
